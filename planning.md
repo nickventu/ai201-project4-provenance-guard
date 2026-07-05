@@ -384,8 +384,3 @@ confirming all three are actually reachable, then submitting a test
 appeal and confirming the audit log entry's status flips to
 `under_review` and shows up in `GET /appeals?status=under_review`.
 
-## 7. Out of scope for v1
-
-- Automated re-classification after appeal (explicitly not required)
-- Multi-language support
-- Image/audio/video content
