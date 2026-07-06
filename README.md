@@ -324,6 +324,12 @@ README.md
 
 ## Spec reflection
 
+The spec was a big help when generating the submission endpoint and two signals, the AI Tool Plan guided my prompts and the Components section made it easier to organize than if it wasn't there in the beginning.
+
+One big way implementation diverged from the spec was the implementation of stylometric signal. The actual implementation uses vocabulary diversity (Guiraud's Index) + burstiness scoring, perplexity was scrapped entirely after testing showed it penalized domain-specific vocabulary regardless of authorship.
 
 ## AI usage
 
+When the stylometric signal's vocabulary metric failed on short text Claude laid out three options: implement MATTR (a proper length-normalized fix), retest with longer samples, or accept a simpler reweighting heuristic. I declined and overrode the MATTR suggestion because I prioritized simplicity over a more correct complex fix.
+
+Claude generated a full CalibrationModel class (fit/predict/save/load, gradient descent, Platt scaling) into aggregate.py, matching the original spec design. I ended up revising the confidence scoring and ultimately deleting CalibrationModel in favor of just combining the two signal's scores for confidence score.

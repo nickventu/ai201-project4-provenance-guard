@@ -38,7 +38,6 @@ entry by content_id, writes an appeal record, sets status to
 |---|---|---|
 | `api/routes.py` | `POST /submit`, `POST /appeal/{id}`, `GET /log`, `GET /appeals` | Flask |
 | `middleware/rate_limit.py` | Enforce per-key request limits | Flask-Limiter |
-| `pipeline/preprocess.py` | Clean text, compute content hash | Hash = audit log key |
 | `pipeline/signals/stylometric.py` | Perplexity + burstiness scoring | Signal 1, pure Python |
 | `pipeline/signals/llm_classifier.py` | Groq (`llama-3.3-70b-versatile`) holistic judgment | Signal 2 |
 | `pipeline/aggregate.py` | Combine signals → raw_score + confidence | Calibration model (see Section 5), tunable |
@@ -314,6 +313,16 @@ lands as **uncertain**, not "leaning AI." That's intentional: 0.6 is
 barely better than a guess and the label should say so, not dress it up
 as a lean.
 
+**Amendment (post-implementation):** the calibration approach below assumes
+a labeled dataset of known-AI/known-human text would be available to fit
+the model. That was never actually in scope for this assignment — this
+wasn't clear when the section was originally written. The system instead
+uses a documented heuristic (50/50 average, or 20/80 favoring the LLM
+classifier when the stylometric signal flags itself unreliable under ~50
+tokens) — see README.md's "Confidence scoring" section for what actually
+runs. The calibration design below is kept for reference as the intended
+approach if a labeled dataset becomes available.
+
 **Raw signal outputs → calibrated score.** Averaging the two signal
 outputs is *not* the same as calibrating them, and a fixed 50/50 average
 was only a placeholder. The actual mapping:
@@ -341,17 +350,7 @@ bucket), and confirm the "uncertain" bucket actually has close to 50/50
 ground-truth composition — if it doesn't, the thresholds are wrong, not
 just conservative.
 
-## 6. Open questions / TODO
 
-- [ ] Pick actual signal weights (start 50/50, tune against labeled set)
-- [ ] Decide on minimum submission length (signals are unreliable <~50 words)
-- [ ] Persist rate limit state (Redis vs. in-memory for v1)
-- [ ] Decide whether appeals trigger a notification to a human reviewer
-- [ ] Add per-signal confidence, not just aggregate, to the audit log?
-- [ ] Both signals currently over-weight "polish/regularity" as an AI
-      tell (see Section 4a false-positive trace) — consider adding a
-      genre/form hint field to submissions, or a third signal that isn't
-      correlated with structural smoothness
 
 ## AI Tool Plan
 
