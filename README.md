@@ -10,22 +10,30 @@ suitable for showing directly to a reader.
 | Component | Tool | Notes |
 |---|---|---|
 | API framework | Flask | Free, lightweight |
-| Detection signal 1 | Groq (`llama-3.3-70b-versatile`) | Free tier |
-| Detection signal 2 | Stylometric heuristics | Pure Python, no external libraries needed |
+| Detection signal 1 | Stylometric heuristics | Pure Python, no external libraries needed |
+| Detection signal 2 | Groq (`llama-3.3-70b-versatile`) | Free tier |
 | Rate limiting | Flask-Limiter | Free |
-| Audit log | SQLite (built-in) or structured JSON | No additional setup |
+| Audit log | SQLite (stdlib `sqlite3`) | No additional setup |
 
-## How a submission flows through the system
+## Architecture overview
 
 1. **`POST /submit`** receives the text and immediately passes it through
-   a **rate limiter**. Over the limit → rejected with 429, nothing else runs.
-2. The **preprocessor** normalizes the text and computes a content hash
-   (this becomes the record's ID everywhere downstream).
-3. Two independent signals run in parallel:
-   - **Stylometric signal**: perplexity + burstiness (statistical/predictability).
-   - **LLM classifier signal**: Groq (`llama-3.3-70b-versatile`) judges the text holistically.
+   a **rate limiter**. Over the limit → rejected with `429`, nothing else runs.
+2. The text is normalized (whitespace collapsed) and hashed into a
+   `content_id` — this becomes the record's ID everywhere downstream.
+   (This is currently a small inline step in `api/routes.py`, not a
+   separate preprocessing module — real normalization decisions like
+   case folding and unicode handling are out of scope for this pass.)
+3. Two independent signals run against the cleaned text:
+   - **Stylometric signal**: vocabulary diversity (Guiraud's Index) +
+     burstiness (sentence-length variance) — pure statistical measures,
+     no external calls.
+   - **LLM classifier signal**: Groq (`llama-3.3-70b-versatile`) judges
+     the text holistically.
 4. The **aggregator** combines both into a `raw_score` (P(AI-generated),
-   0–1) and a `confidence` (how far that score is from a coin flip).
+   0–1) and a `confidence` (how far that score is from a coin flip). See
+   **Confidence scoring** below for exactly how — this is a documented
+   heuristic combination, not a fitted/calibrated model.
 5. The **label generator** maps `(raw_score, confidence)` to exactly one
    of three fixed label strings (below) — never free text.
 6. The **audit logger** writes a structured entry (signals, scores,
@@ -34,57 +42,70 @@ suitable for showing directly to a reader.
 
 Separately, creators can dispute a decision via **`POST /appeal/{content_id}`**,
 which logs their reasoning against the original decision and flips the
-content's status to `under_review`.
+content's status to `under_review`. Appeals are joined into `GET /log`
+output directly.
 
-## Why two signals
+## Detection signals
 
-### Signal 1: Stylometric (perplexity + burstiness)
+### Signal 1: Stylometric (vocabulary diversity + burstiness)
 
-**What it measures.** Perplexity: how predictable each word is, on
-average, given the words before it, scored against a reference language
-model. Burstiness: how much sentence length and structure vary across
-the piece — a mix of short, punchy sentences and long, meandering ones
-vs. a uniform rhythm throughout.
+**What it measures.** Vocabulary diversity, via **Guiraud's Index**
+(`unique_words / sqrt(total_words)`): how much a piece of writing repeats
+itself relative to its length. Burstiness: variance in sentence length
+across the piece — a mix of short, punchy sentences and long, meandering
+ones vs. a uniform rhythm throughout.
 
-**Why it differs human vs. AI.** Generative models are trained to
-produce the *most locally probable* next token, so their output tends to
-sit in a narrow, low-surprise band — smooth, evenly-paced, few
-structural surprises. Human writers make less "optimal" choices: odd
-word order, tangents, a sentence that runs on and then one that doesn't,
-inconsistent register. That unevenness shows up directly as higher
-perplexity and higher burstiness.
+**Why choose it.** Generative models tend toward safe, repetitive
+phrasing and even sentence structure — output that sits in a narrow,
+low-surprise band. Human writers make less "optimal" choices: varied
+vocabulary, a sentence that runs on and then one that doesn't,
+inconsistent register. That unevenness shows up as higher vocabulary
+diversity and higher burstiness.
 
-**What it can't capture.**
-- Needs enough text to be statistically stable — under ~50-100 words,
-  perplexity/burstiness estimates are noisy and unreliable.
+An earlier version of this signal used pseudo-perplexity against a small
+hardcoded table of common English words instead of vocabulary diversity.
+It was replaced after direct testing showed it penalized any text using
+vocabulary outside that table — a formulaic AI corporate-speak sample
+scored as *more* human-like than a real human narrative, purely because
+words like "leveraging" and "stakeholders" weren't in the reference
+table. Guiraud's Index needs no reference vocabulary, so it doesn't have
+that failure mode.
+
+**What it misses.**
+- Needs enough text to be statistically stable — under ~50 words,
+  vocabulary-diversity and burstiness estimates are noisy. The signal
+  flags this itself (`low_reliability`); see **Confidence scoring**.
+- Vocabulary diversity is still length-confounded even after the
+  Guiraud correction, just less severely than a raw ratio would be — a
+  longer AI sample can out-score a shorter human sample on this
+  sub-signal for reasons of length alone, not word choice. Confirmed
+  directly in testing (see **Known limitations**).
+- The sentence-length-variance measure uses a naive punctuation-based
+  splitter, which can misread short, casual, punctuation-light sentences
+  as "uniform" (AI-like) when they're actually just casual speech.
 - Naturally formulaic *human* writing (legal boilerplate, fixed poetic
-  forms like sonnets or villanelles, ESL writers with simpler and more
-  regular sentence structures) reads as "smooth" and can false-positive
+  forms, ESL sentence patterns) reads as "smooth" and can false-positive
   as AI, even though the smoothness has nothing to do with generation.
-- Heavily human-edited AI drafts (or AI drafts polished by a human) can
-  pick up enough irregularity to false-negative as human.
-- It has no idea what the text *means* — a fluent but factually or
-  semantically strange AI passage can still score as "human-like" if the
-  surface statistics happen to be irregular.
-- Sensitive to which reference language model computes the perplexity;
-  a mismatch between that model's training data and the text's genre
-  (e.g. free verse poetry) skews the estimate.
+- No semantic understanding at all — a fluent but factually strange AI
+  passage can still score as "human-like" if its surface statistics
+  happen to be irregular.
 
 ### Signal 2: LLM classifier (Groq `llama-3.3-70b-versatile`)
 
 **What it measures.** A holistic judgment call: the model is prompted to
-assess tone, cliché density, thematic coherence, and "voice"
-consistency, and to return its own probability estimate of AI origin.
+assess tone, cliché density, coherence, and "voice" consistency, and to
+return its own probability estimate of AI origin.
 
-**Why it differs human vs. AI.** The classifier has, in effect, seen a
-huge amount of both AI and human text during its own training, and has
-picked up on patterns that don't reduce to token-level statistics — AI
-text tends toward safe, generic phrasing, over-explaining, hedging, and
-a lack of specific concrete or personal detail; human text tends to
-carry idiosyncratic voice, concrete anecdote, and emotional messiness
-that's hard to fake at the sentence-structure level alone.
+**Why choose it.** The classifier has, in effect, seen a large amount
+of both AI and human text during its own training and has picked up on
+patterns that don't reduce to token-level statistics — AI text tends
+toward safe, generic phrasing and a lack of concrete or personal detail;
+human text tends to carry idiosyncratic voice and detail that's harder
+to fake at the word/sentence-structure level alone. In testing, this
+signal consistently ranked samples in the correct direction even when
+the stylometric signal didn't.
 
-**What it can't capture.**
+**What it misses.**
 - It's a subjective judgment formatted as a probability, not a
   principled decision boundary — it can be overconfident, and can give
   different estimates on different runs of the same text.
@@ -93,109 +114,79 @@ that's hard to fake at the sentence-structure level alone.
   own work through a grammar checker.
 - Susceptible to adversarial gaming: a few deliberately "quirky" errors
   inserted into AI text can shift its judgment.
-- No actual visibility into provenance — it's estimating typicality
+- No actual visibility into provenance, it's just estimating typicality
   against patterns it's seen, not detecting generation directly.
-- Uneven exposure across genres: it likely has seen far more AI-written
-  corporate blog copy than AI-written free verse, so its judgment is
-  more reliable in genres it has more reference points for.
 
-A single signal is not acceptable here because each has different blind
-spots — and, importantly, some of those blind spots overlap (both
-signals key off "polish" and "smoothness" as an AI tell), which means
-they aren't always independent votes. Aggregating them raises the bar
-for a confident label, but does not eliminate correlated failure —
-see the worked example below.
-
-## Worked example: a false positive
-
-**Scenario.** A human poet submits an original villanelle — a strict,
-repeating-refrain form — that they also ran through a grammar checker
-before submitting.
-
-1. Request clears the rate limiter and preprocessor; gets `content_id = f3a9c1`.
-2. **Stylometric signal** sees a fixed refrain structure, even line
-   lengths, and grammar-checker-smoothed phrasing → low burstiness, low
-   perplexity → estimates `P(AI) = 0.93`. The signal has no concept of
-   "villanelle"; strict form *looks* like generation-style uniformity to it.
-3. **LLM classifier** (Groq `llama-3.3-70b-versatile`) reads clean, competent, slightly generic imagery
-   (typical of the form itself, not of AI) and flags it as "safe" and
-   "polished" → estimates `P(AI) = 0.87`.
-4. **Aggregator**: `raw_score = 0.90`, `confidence = 2*|0.90-0.5| = 0.80`.
-5. **Label generator**: confidence 0.80 clears the 0.7 threshold, raw_score
-   > 0.5 → **high-confidence AI** label is shown, even though the poem
-   is entirely human-written.
-
-**How the confidence score reflects (and fails to reflect) uncertainty.**
-The confidence score measures *how strongly the two signals agree*, not
-whether that agreement is correct. Here both signals independently
-misfire for the same underlying reason — they both treat polish and
-structural regularity as an AI tell — so their agreement is confident
-but wrong. This is a correlated-blind-spot failure, not a case of one
-signal catching what the other missed. It's exactly what the calibration
-testing described above is meant to surface: if "high-confidence AI"
-buckets in a labeled test set contain a meaningful fraction of true
-human writing in strict forms, that's a sign the thresholds or signal
-weights need adjusting, not that the poet did something wrong.
-
-**What the label says.** The reader (and the poet) see, verbatim:
-`"This content appears to be AI-generated (confidence: high)."`
-
-**How the creator appeals.** The poet calls
-`POST /appeal/f3a9c1` with their reasoning, e.g. *"This is an original
-villanelle I wrote myself. I only used a grammar checker for typos; no
-generation tool was used."* The appeals handler:
-1. Looks up the audit log entry for `f3a9c1`.
-2. Writes a new appeal record (reasoning + timestamp) referencing that entry.
-3. Sets the content's status to `under_review`.
-
-No automatic re-scoring happens. The audit log entry for `f3a9c1` now
-shows the appeal alongside the original decision (see the audit log
-example below), so a human reviewer sees both the original signals *and*
-the poet's stated context — including the detail the automated pipeline
-had no way to know: that the form itself explains the smoothness.
+**Why two signals, not one.** Each has different blind spots and
+some of those blind spots overlap (both signals can key off
+"polish" as an AI tell), so they aren't always independent votes.
+Aggregating them raises the bar for a confident label but does not
+eliminate correlated failure.
 
 ## Confidence scoring
 
-- `raw_score` = P(AI-generated), 0–1 — the *output of a calibration
-  model*, not a raw average of the two signals (see below).
+- `raw_score` = P(AI-generated), 0–1.
 - `confidence` = `2 * |raw_score - 0.5|` — distance from a 50/50 guess,
   rescaled to 0–1. A raw_score of 0.51 yields confidence ≈ 0.02 (near
   meaningless); a raw_score of 0.95 yields confidence = 0.90 (strong).
 - Labeling thresholds: `confidence >= 0.7` → high-confidence label (AI or
   human, by sign of raw_score vs. 0.5); otherwise → uncertain.
 
-**What a specific score means.** A `raw_score` of 0.6 means: among past
-cases where our signals produced this same output pattern, about 60%
-turned out to be AI-generated — a statement about frequency in similar
-cases, not a claim about the text itself. Its confidence is `2*|0.6-0.5|
-= 0.2` — low — so it displays as **uncertain**, not "leaning AI." A 0.6
-is barely better than a coin flip and the label says so.
+**How the two signals are combined.** `raw_score` is produced by a
+documented heuristic, not a calibrated model:
+- Default: a plain 50/50 average of both signal scores.
+- When the stylometric signal flags itself as `low_reliability` (under
+  ~50 tokens), it's down-weighted to 20%, with the LLM classifier at
+  80% — using a flag the signal already computes, not a new invented
+  threshold. Testing surfaced concrete short-text cases where
+  stylometric disagreed with ground truth while the LLM classifier
+  ranked correctly, so leaning on the LLM signal specifically in the
+  regime stylometric already admits it's unreliable in is a direct
+  response to that evidence.
 
-**Raw signals → calibrated score.** Simply averaging the two signals'
-outputs is not calibration — it assumes both signals are equally
-trustworthy at every point on their scale, which isn't tested and
-probably isn't true. Instead: collect a labeled set of known-AI/known-human
-text, run both signals over it, and fit a small calibration model
-(logistic regression / Platt scaling) mapping `(signal_1, signal_2) →
-P(AI)`. That fitted model's output becomes `raw_score`. This corrects
-for a signal being systematically over- or under-confident — e.g. if the
-LLM classifier's 0.9-scored outputs are only right 70% of the time in
-the labeled set, calibration pulls that down toward 0.7 instead of
-trusting it at face value.
+A real calibration model — fitting a logistic regression on labeled
+`(signal_1, signal_2) → ground_truth` pairs — was part of the original
+design and the code path for it was prototyped, but building an actual
+labeled dataset of known-AI/known-human text was out of scope for this
+assignment. The heuristic above is what actually runs.
 
-**How we tested whether the scores mean anything:** we ran both signals
-over a held-out labeled set of known-AI and known-human samples and
-plotted a calibration curve — predicted raw_score bucket vs. actual
-fraction of AI samples in that bucket. A well-calibrated system should
-have its "0.9 raw_score" bucket actually be ~90% AI in ground truth, not
-just "usually AI." We also explicitly checked that the "uncertain" bucket
-has close to 50/50 ground-truth composition — if uncertain cases were
-actually 90% AI, our thresholds would be miscalibrated, not just cautious.
+**How we tested whether the scores mean anything.** Rather than a
+calibration curve (which needs labeled data we don't have), we ran the
+combined pipeline against real submissions of known/expected type —
+clearly AI-generated text, clearly casual human writing, and several
+deliberately extreme/unambiguous constructed examples — and checked
+whether confidence actually tracked how unambiguous the input was. The
+result: confidence rarely reached the high-confidence threshold except
+in the most extreme cases, and high-confidence-human was never reached
+in testing at all, even for inputs specifically constructed to be
+maximally unambiguous. That's a real, reproducible finding about the
+system's current behavior (see **Known limitations**), not a claim that
+the scores are statistically well-calibrated.
+
+**Two real example submissions, with noticeably different confidence:**
+
+*High-confidence example* — a short, formulaic AI-generated paragraph
+(corporate-jargon style, under 50 tokens, so reliability-weighted 20/80):
+```
+signals: {"llm_classifier": 0.9, "stylometric": 0.875}
+raw_score: 0.895
+confidence: 0.790
+label: "This content appears to be AI-generated (confidence: high)."
+```
+
+*Low-confidence example* — a casual, first-person restaurant review
+(over 50 tokens, plain 50/50 average):
+```
+signals: {"llm_classifier": 0.2, "stylometric": 0.720}
+raw_score: 0.460
+confidence: 0.080
+label: "We could not confidently determine whether this content is
+        AI-generated or human-created. Treat this result as inconclusive."
+```
 
 ## Transparency labels (verbatim)
 
-These are the exact three strings the label generator can return. There
-is no fourth option and no freeform text — only these three ever reach a reader.
+These are the exact three strings the label generator can return.
 
 | Case | Label text shown to reader |
 |---|---|
@@ -207,7 +198,7 @@ is no fourth option and no freeform text — only these three ever reach a reade
 
 `POST /appeal/{content_id}` with a body containing the creator's written
 reasoning. This:
-1. Looks up the original audit log entry by `content_id`.
+1. Looks up the original audit log entry by `content_id` (404 if unknown).
 2. Writes a new appeal record referencing that entry (reasoning + timestamp).
 3. Updates the content's status to `under_review`.
 
@@ -216,93 +207,94 @@ review, not a re-run of the pipeline.
 
 **Reviewer queue.** `GET /appeals?status=under_review` returns open
 appeals with the original decision and the appeal reasoning side by
-side, so a reviewer doesn't have to cross-reference two views:
+side. `GET /log?content_id=...` also shows the appeal directly embedded
+in that entry, so appeals are visible both ways — through the reviewer
+queue and through the audit log itself.
 
-```json
-[
-  {
-    "content_id": "f3a9c1",
-    "original_decision": {
-      "signals": {"stylometric": 0.93, "llm_classifier": 0.87},
-      "raw_score": 0.90,
-      "confidence": 0.80,
-      "label": "This content appears to be AI-generated (confidence: high)."
-    },
-    "appeal": {
-      "reasoning": "This is an original villanelle I wrote myself...",
-      "submitted_at": "2026-07-02T09:15:00Z"
-    },
-    "status": "under_review"
-  }
-]
-```
+## Known limitations
 
-## Anticipated edge cases
+**Casual/informal short-form text is consistently misclassified by the
+stylometric signal**
+Across multiple real test submissions (a casual restaurant review, a
+casual personal story, and my own reflective writing), the stylometric 
+signal scored *higher* on the AI-likelihood scale than clearly AI-generated samples did — in one case
+reaching the maximum possible value (1.0) on real human writing. This
+happens because casual, conversational text tends to reuse simple words
+and run in short, similarly-sized clauses, which both sub-metrics
+(vocabulary diversity and burstiness) read as "smooth"/AI-like, even
+though the actual cause is register, not generation. The LLM classifier
+signal did not share this failure in the same cases — it's specifically
+a stylometric blind spot.
 
-Two specific scenarios the current design is expected to handle badly:
+**A related, structural limitation:** because the system currently uses
+heuristic averaging rather than a fitted calibration model (see
+**Confidence scoring**), reaching a high-confidence label requires both
+signals to be simultaneously near-extreme. In testing, high-confidence
+AI was reached only once, on a short, maximally unambiguous input, and
+high-confidence human was never reached at all — even for inputs
+specifically constructed to be unambiguous. The system is structurally
+more capable of confidently flagging AI-generated text than confidently
+vindicating human-written text, under the current uncalibrated setup.
 
-1. **A human poem using heavy repetition and simple vocabulary** — a
-   villanelle, a children's-style poem, anything built around a
-   repeated refrain. Repetition suppresses the burstiness signal and
-   simple vocabulary lowers perplexity, so the stylometric signal reads
-   it the same way it would read AI output, even though the repetition
-   is a deliberate literary device. Worked through in detail above.
-2. **A short submission under ~50-100 words.** Both signals need enough
-   text to be statistically stable; perplexity/burstiness get noisy on
-   short samples and the LLM classifier has little to judge beyond
-   surface tone. There's currently no length-aware fallback, so a short
-   piece can still get a confidently-worded label built on a weak read.
+**A secondary, anticipated (not directly tested) scenario:** a human 
+written poem using heavy repetition and simple vocabulary would
+likely trigger the same "smooth" misread described above, for the same
+underlying reason (repetition and simple vocabulary suppress both
+sub-metrics), even though the repetition is a deliberate literary
+device rather than a generation artifact.
 
 ## Rate limiting
 
-- **10 requests / minute** and **200 requests / day**, per API key, enforced via **Flask-Limiter**.
+- **10 requests per minute**, per client IP, enforced via
+  **Flask-Limiter**, applied only to `POST /submit`.
 
-**Reasoning:** each submission triggers a live call to an external LLM
-(cost per token) plus local compute for the stylometric signal. A
-per-minute cap prevents burst abuse or accidental infinite loops from a
-client; a per-day cap bounds worst-case cost exposure from a single key
-without meaningfully affecting a legitimate individual creator submitting
-their own work for review. Both numbers are intentionally conservative
-for v1 and expected to move once real usage patterns are known.
+**Reasoning:** `/submit` is the only endpoint that triggers a real,
+paid external API call (Groq) plus local compute on every request — the
+read endpoints (`GET /log`, `GET /appeals`) are local SQLite reads with
+no comparable cost, so they aren't rate-limited here. 10/minute is
+generous enough for a real reader or a manual test session (nobody
+legitimately submits more than roughly one piece of content every few
+seconds) but low enough to make a scripted abuse attempt slow and
+noticeable rather than free and instant. This uses Flask-Limiter's
+default in-memory storage, which resets on restart and doesn't share
+state across multiple worker processes — acceptable for a single-process
+dev/demo deployment
 
 ## Audit log
 
-Every attribution decision is written as a structured entry (SQLite or
-structured JSON — no ORM needed for this scope), viewable via `GET /log`.
-Example entries:
+Every attribution decision is written as a structured entry (SQLite,
+`storage/audit_log.py`), viewable via `GET /log`. Real entries from
+testing:
 
 ```json
 [
   {
-    "content_id": "a1b2c3d4",
-    "timestamp": "2026-07-01T14:02:11Z",
-    "signals": {"stylometric": 0.88, "llm_classifier": 0.91},
-    "raw_score": 0.895,
-    "confidence": 0.79,
-    "label": "This content appears to be AI-generated (confidence: high).",
-    "appeal": null
+    "content_id": "524f9a",
+    "signals": {"llm_classifier": 0.9, "stylometric": 0.5},
+    "raw_score": 0.7,
+    "confidence": 0.4,
+    "label": "We could not confidently determine whether this content is AI-generated or human-created. Treat this result as inconclusive.",
+    "appeal": {
+      "reasoning": "I wrote this myself, no AI tool involved.",
+      "status": "under_review",
+      "submitted_at": "2026-07-06T03:29:08.989462+00:00"
+    }
   },
   {
-    "content_id": "e5f6a7b8",
-    "timestamp": "2026-07-01T14:05:47Z",
-    "signals": {"stylometric": 0.22, "llm_classifier": 0.15},
-    "raw_score": 0.185,
-    "confidence": 0.63,
+    "content_id": "fff4ce",
+    "signals": {"llm_classifier": 0.8, "stylometric": 1.0},
+    "raw_score": 0.84,
+    "confidence": 0.68,
     "label": "We could not confidently determine whether this content is AI-generated or human-created. Treat this result as inconclusive.",
     "appeal": null
   },
   {
-    "content_id": "c9d0e1f2",
-    "timestamp": "2026-07-01T14:11:03Z",
-    "signals": {"stylometric": 0.10, "llm_classifier": 0.08},
-    "raw_score": 0.09,
-    "confidence": 0.82,
-    "label": "This content appears to be human-created (confidence: high).",
-    "appeal": {
-      "submitted_at": "2026-07-02T09:15:00Z",
-      "reasoning": "This is my own original poem; I only used a grammar checker.",
-      "status": "under_review"
-    }
+    "content_id": "819676",
+    "signals": {"llm_classifier": 0.2, "stylometric": 0.7198672168136984},
+    "raw_score": 0.45993368840684916,
+    "confidence": 0.08013278318630168,
+    "label": "We could not confidently determine whether this content is AI-generated or human-created. Treat this result as inconclusive.",
+    "appeal": null
   }
 ]
 ```
@@ -311,24 +303,27 @@ Example entries:
 
 ```
 api/
-  routes.py               # Flask: /submit, /appeal/{id}, /log, /appeals
+  routes.py                 # Flask: /submit, /appeal/{id}, /log, /appeals
 middleware/
-  rate_limit.py            # Flask-Limiter
+  rate_limit.py              # Flask-Limiter (10/min on /submit)
 pipeline/
-  preprocess.py
-  aggregate.py
-  label.py
+  aggregate.py                # combines both signals -> raw_score + confidence
+  label.py                    # maps (raw_score, confidence) -> 1 of 3 label strings
   signals/
-    stylometric.py
-    llm_classifier.py       # Groq llama-3.3-70b-versatile
+    stylometric.py             # vocabulary diversity (Guiraud) + burstiness
+    llm_classifier.py           # Groq llama-3.3-70b-versatile
 storage/
-  audit_log.py              # SQLite or structured JSON
-  appeals.py
+  audit_log.py                # SQLite audit log
+  appeals.py                   # SQLite appeal records, linked by content_id
+tests/
+  test_signals.py              # unit + integration tests
+conftest.py
 planning.md
 README.md
 ```
 
-## Status
+## Spec reflection
 
-Template/scaffold — see `planning.md` for open questions and TODOs before
-implementation.
+
+## AI usage
+

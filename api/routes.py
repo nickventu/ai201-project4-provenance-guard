@@ -76,7 +76,6 @@ def submit():
         signals=result["signals"],
         raw_score=result["raw_score"],
         confidence=result["confidence"],
-        calibrated=result["calibrated"],
         label=labeled.label,
     )
 
@@ -113,6 +112,24 @@ def submit_appeal(content_id: str):
 def get_log_route():
     content_id = request.args.get("content_id")
     entries = audit_log.get_all(content_id=content_id)
+
+    # Enrich each entry with its appeal, if one exists -- null if not.
+    # This is what makes appeals actually "captured in the structured
+    # audit log" (not just visible via the separate GET /appeals reviewer
+    # view): joined at read-time here, same pattern as GET /appeals uses
+    # in reverse, still no separate appeals store per planning.md.
+    for entry in entries:
+        appeal = appeals.get_appeal(entry["content_id"])
+        entry["appeal"] = (
+            {
+                "reasoning": appeal["reasoning"],
+                "status": appeal["status"],
+                "submitted_at": appeal["submitted_at"],
+            }
+            if appeal is not None
+            else None
+        )
+
     return jsonify(entries), 200
 
 

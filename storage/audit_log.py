@@ -38,7 +38,6 @@ CREATE TABLE IF NOT EXISTS audit_log (
     signals     TEXT NOT NULL,   -- JSON: {"stylometric": 0.62, "llm_classifier": 0.80}
     raw_score   REAL NOT NULL,
     confidence  REAL NOT NULL,
-    calibrated  INTEGER NOT NULL,  -- 0/1: was a fitted calibration model used
     label       TEXT,              -- nullable until label.py (M5) exists
     created_at  TEXT NOT NULL      -- ISO 8601 UTC
 );
@@ -72,7 +71,6 @@ def log_result(
     signals: dict,
     raw_score: float,
     confidence: float,
-    calibrated: bool,
     label: Optional[str] = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> dict:
@@ -90,7 +88,6 @@ def log_result(
         "signals": signals,
         "raw_score": raw_score,
         "confidence": confidence,
-        "calibrated": calibrated,
         "label": label,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -99,15 +96,14 @@ def log_result(
         conn.execute(
             """
             INSERT OR REPLACE INTO audit_log
-                (content_id, signals, raw_score, confidence, calibrated, label, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (content_id, signals, raw_score, confidence, label, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 entry["content_id"],
                 json.dumps(entry["signals"]),
                 entry["raw_score"],
                 entry["confidence"],
-                int(entry["calibrated"]),
                 entry["label"],
                 entry["created_at"],
             ),
@@ -153,7 +149,6 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
         "signals": json.loads(row["signals"]),
         "raw_score": row["raw_score"],
         "confidence": row["confidence"],
-        "calibrated": bool(row["calibrated"]),
         "label": row["label"],
         "created_at": row["created_at"],
     }
