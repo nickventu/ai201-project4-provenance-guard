@@ -1,51 +1,63 @@
 """
-Audit log storage (Section 3a: `storage/audit_log.py`).
+Audit log (Section 3a: storage/audit_log.py).
 
-"Append-only structured log" — every /submit decision (content_id,
-signals, scores, label) gets written here. Backed by SQLite (stdlib
-`sqlite3`, no ORM), per the Section 3 tech stack table.
+Append-only structured log, keyed by content_id (the content hash), per
+Section 3a: "Append-only structured log ... Hash = audit log key".
 
-Note on schema: the requested example log shape included `creator_id`
-and `llm_score` fields. Neither is populated here:
-    - `creator_id` would require an auth layer, which doesn't exist in
-      this system (Section 3b explicitly excludes auth endpoints for
-      v1).
-    - `llm_score` belongs to Signal 2 (Groq LLM classifier), which
-      hasn't been built yet — that's M4 work per the AI Tool Plan.
-Both can be added as real columns once those pieces exist, rather than
-filled with placeholder/fake data now.
+Uses SQLite (stdlib sqlite3, no ORM) -- one of the two options explicitly
+allowed by Section 3 tech stack ("SQLite (built-in) or structured JSON").
+SQLite is picked here over flat JSON because Section 3b's GET /log
+(optional ?content_id= filter) and GET /appeals (join against the
+original decision) both want simple, indexed lookups rather than
+scanning a JSON file on every request.
 
-`status` defaults to "classified" and will later flip to "under_review"
-once the appeals flow (`storage/appeals.py`, M5) is wired up.
+Each row captures, per the checkpoint requirement: the individual signal
+scores, the combined raw_score/confidence, and (once label.py exists in
+M5) the label text. label is nullable for now since M4 doesn't generate
+labels yet -- that's Section 5/M5 work, not this module's job.
+
+This module does NOT compute content_id or run the signals -- it only
+persists what it's given. Keeping hashing/scoring out of this file
+matches the separation of concerns already established elsewhere in
+the pipeline (aggregate.py doesn't know about storage; storage doesn't
+know about signals).
 """
 
-from __future__ import annotations
-
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
+from typing import Optional
 
-DB_PATH = Path(__file__).parent / "audit_log.db"
+DEFAULT_DB_PATH = "audit_log.db"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_log (
-    content_id TEXT PRIMARY KEY,
-    timestamp TEXT NOT NULL,
-    signals TEXT NOT NULL,
-    raw_score REAL NOT NULL,
-    confidence REAL NOT NULL,
-    attribution_result TEXT NOT NULL,
-    label TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'classified'
+    content_id  TEXT PRIMARY KEY,
+    signals     TEXT NOT NULL,   -- JSON: {"stylometric": 0.62, "llm_classifier": 0.80}
+    raw_score   REAL NOT NULL,
+    confidence  REAL NOT NULL,
+    calibrated  INTEGER NOT NULL,  -- 0/1: was a fitted calibration model used
+    label       TEXT,              -- nullable until label.py (M5) exists
+    created_at  TEXT NOT NULL      -- ISO 8601 UTC
 );
 """
 
 
+def compute_content_id(text: str) -> str:
+    """
+    Hash the (already-normalized) text into a short content_id, matching
+    the "f3a9c1"-style ids used throughout planning.md's examples.
+    NOTE: real normalization belongs to pipeline/preprocess.py (not yet
+    built) -- this just hashes whatever string it's given.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:6]
+
+
 @contextmanager
-def _connect():
-    conn = sqlite3.connect(DB_PATH)
+def _connect(db_path: str = DEFAULT_DB_PATH):
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute(_SCHEMA)
@@ -55,72 +67,93 @@ def _connect():
         conn.close()
 
 
-def log_entry(
+def log_result(
     content_id: str,
     signals: dict,
     raw_score: float,
     confidence: float,
-    attribution_result: str,
-    label: str,
-    status: str = "classified",
-) -> None:
+    calibrated: bool,
+    label: Optional[str] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> dict:
     """
-    Write one audit log entry. Called from api/routes.py right before
-    the /submit response goes out, per the Architecture diagram's
-    "content_id, signals, scores, label all written together" note.
+    Write one audit entry. Append-only: re-logging the same content_id
+    overwrites that row (a resubmission of identical content should
+    reflect the latest scoring run, not silently fail or duplicate) --
+    this is the one deliberate exception to "append-only" and is
+    explicitly INSERT OR REPLACE, not an UPDATE-by-mistake.
 
-    `INSERT OR REPLACE` on content_id: since content_id is derived from
-    a hash of the normalized text (see api/routes.py), re-submitting
-    identical content overwrites rather than duplicates. Revisit if
-    duplicate submissions of the same text should instead be tracked as
-    separate events.
+    Returns the entry as a dict, exactly as it was stored.
     """
-    with _connect() as conn:
+    entry = {
+        "content_id": content_id,
+        "signals": signals,
+        "raw_score": raw_score,
+        "confidence": confidence,
+        "calibrated": calibrated,
+        "label": label,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    with _connect(db_path) as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO audit_log
-                (content_id, timestamp, signals, raw_score, confidence,
-                 attribution_result, label, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (content_id, signals, raw_score, confidence, calibrated, label, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                content_id,
-                datetime.now(timezone.utc).isoformat(),
-                json.dumps(signals),
-                raw_score,
-                confidence,
-                attribution_result,
-                label,
-                status,
+                entry["content_id"],
+                json.dumps(entry["signals"]),
+                entry["raw_score"],
+                entry["confidence"],
+                int(entry["calibrated"]),
+                entry["label"],
+                entry["created_at"],
             ),
         )
 
+    return entry
 
-def get_log(limit: int = 3) -> list[dict]:
+
+def get_entry(content_id: str, db_path: str = DEFAULT_DB_PATH) -> Optional[dict]:
+    """Fetch one entry by content_id, or None if it doesn't exist."""
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM audit_log WHERE content_id = ?", (content_id,)
+        ).fetchone()
+
+    if row is None:
+        return None
+    return _row_to_dict(row)
+
+
+def get_all(content_id: Optional[str] = None, db_path: str = DEFAULT_DB_PATH) -> list[dict]:
     """
-    Return the most recent `limit` audit log entries, newest first.
-
-    Section 3b also calls for an optional `?content_id=` filter on
-    `GET /log` — not implemented here since the current ask is just
-    "most recent N"; add a `content_id` kwarg here (and a query-param
-    passthrough in the route) when that's needed.
+    Fetch all entries, most recent first, matching GET /log's
+    "?content_id=" optional filter (Section 3b).
     """
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+    with _connect(db_path) as conn:
+        if content_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM audit_log WHERE content_id = ? ORDER BY created_at DESC",
+                (content_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM audit_log ORDER BY created_at DESC"
+            ).fetchall()
 
-    return [
-        {
-            "content_id": row["content_id"],
-            "timestamp": row["timestamp"],
-            "signals": json.loads(row["signals"]),
-            "raw_score": row["raw_score"],
-            "confidence": row["confidence"],
-            "attribution_result": row["attribution_result"],
-            "label": row["label"],
-            "status": row["status"],
-        }
-        for row in rows
-    ]
+    return [_row_to_dict(row) for row in rows]
+
+
+def _row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "content_id": row["content_id"],
+        "signals": json.loads(row["signals"]),
+        "raw_score": row["raw_score"],
+        "confidence": row["confidence"],
+        "calibrated": bool(row["calibrated"]),
+        "label": row["label"],
+        "created_at": row["created_at"],
+    }
